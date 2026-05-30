@@ -1,4 +1,6 @@
 fastapi
-uvicorn
 python-multipart
-pyhanko
+uvicorn
+pyHanko
+pyhanko-certvalidator
+asn1crypto
