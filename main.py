@@ -3,52 +3,73 @@ from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign.validation import validate_pdf_signature
 from pyhanko_certvalidator import ValidationContext
 import io
+import os
 
 app = FastAPI()
 
-def extrair_cpf_cnpj_icp_brasil(cert):
-    # OID 2.16.76.1.3.1 é o padrão para CPF na ICP-Brasil
-    # OID 2.16.76.1.3.3 é o padrão para CNPJ na ICP-Brasil
-    try:
-        for extension in cert.extensions:
-            if extension.oid.dotted == '2.5.29.17':  # Subject Alternative Name
-                # A lógica aqui exigiria o parse do GeneralNames para buscar os OIDs da ICP-Brasil
-                # Para simplificar, muitas vezes o serial_number contém o CPF ao final do nome
-                pass
-        return cert.subject.native.get('serial_number', '')
-    except:
-        return ""
+def carregar_raizes_confianca():
+    """
+    Varre a raiz do projeto em busca de arquivos .crt e .pem 
+    para carregar como âncoras de confiança.
+    """
+    raizes = []
+    extensoes_permitidas = ('.crt', '.pem')
+    
+    for arquivo in os.listdir('.'):
+        if arquivo.endswith(extensoes_permitidas):
+            raizes.append(arquivo)
+    
+    return raizes
 
 @app.post("/report")
 async def validar_assinatura(file: UploadFile = File(...)):
     try:
+        # Lê o arquivo PDF recebido
         content = await file.read()
         pdf_file = io.BytesIO(content)
         reader = PdfFileReader(pdf_file)
         
+        # Carrega dinamicamente todos os certificados que você subiu
+        lista_certificados = carregar_raizes_confianca()
+        
+        try:
+            # Cria o contexto de validação com a cadeia completa informada
+            vc = ValidationContext(trust_roots=lista_certificados)
+        except Exception:
+            # Fallback caso haja erro no carregamento das cadeias
+            vc = None
+        
         assinaturas = []
         
-        # O pyHanko permite validar a assinatura criptograficamente
+        # Itera sobre todas as assinaturas encontradas no documento
         for sig in reader.embedded_signatures:
-            # Validação básica de integridade (o arquivo foi mexido?)
-            status_validacao = validate_pdf_signature(sig)
+            # Realiza a validação criptográfica (Integridade + Cadeia de Confiança)
+            status_validacao = validate_pdf_signature(sig, validation_context=vc)
             
             nome_assinante = sig.signer_cert.subject.native.get('common_name', 'Desconhecido')
-            documento = extrair_cpf_cnpj_icp_brasil(sig.signer_cert)
             
-            # Verificamos se o hash bate e se a assinatura cobre o documento
-            esta_integro = status_validacao.intact and status_validacao.valid
+            # Validações individuais
+            esta_integro = status_validacao.intact
+            eh_confiavel = status_validacao.valid
             
             assinaturas.append({
                 "signer_name": nome_assinante,
-                "document": documento,
-                "status": "valid" if esta_integro else "invalid",
-                "integrity": status_validacao.intact,
-                "authentic": status_validacao.valid,
-                "message": "Assinatura verificada criptograficamente." if esta_integro else "Falha na integridade da assinatura."
+                "integrity": esta_integro,
+                "trusted_chain": eh_confiavel,
+                "status": "valid" if (esta_integro and eh_confiavel) else "invalid",
+                "message": "Assinatura valida e reconhecida pela ICP-Brasil." if eh_confiavel else "Assinatura detectada, mas a cadeia nao eh confiavel ou o arquivo foi alterado."
             })
             
-        return {"signatures": assinaturas}
+        return {
+            "total_signatures": len(assinaturas),
+            "signatures": assinaturas
+        }
         
     except Exception as e:
-        return {"error": f"Erro no processamento: {str(e)}"}
+        # Retorno de erro formatado sem negritos para o Apps Script
+        return {"error": f"Falha no processamento do documento: {str(e)}"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
