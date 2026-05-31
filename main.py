@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from pyhanko.pdf_utils.reader import PdfFileReader
-from pyhanko.sign.validation import validate_pdf_signature
+from pyhanko.sign.validation import async_validate_pdf_signature # Importação assíncrona
 from pyhanko_certvalidator import ValidationContext
 import io
 import os
@@ -10,7 +10,6 @@ app = FastAPI()
 def carregar_raizes_confianca():
     raizes = []
     extensoes_permitidas = ('.crt', '.pem')
-    # Lista os arquivos de certificado na raiz para validar a ICP-Brasil
     for arquivo in os.listdir('.'):
         if arquivo.endswith(extensoes_permitidas):
             raizes.append(arquivo)
@@ -26,7 +25,6 @@ async def validar_assinatura(file: UploadFile = File(...)):
         lista_certificados = carregar_raizes_confianca()
         
         try:
-            # Carrega a cadeia de confiança enviada ao GitHub
             vc = ValidationContext(trust_roots=lista_certificados)
         except Exception:
             vc = None
@@ -34,20 +32,24 @@ async def validar_assinatura(file: UploadFile = File(...)):
         assinaturas = []
         
         for sig in reader.embedded_signatures:
-            # Validação criptográfica usando o contexto de certificados
-            status_validacao = validate_pdf_signature(
+            # CORREÇÃO DEFINITIVA: Usando await na função assíncrona
+            status_validacao = await async_validate_pdf_signature(
                 sig, 
                 ts_validation_context=vc 
             )
             
             nome_assinante = sig.signer_cert.subject.native.get('common_name', 'Desconhecido')
             
+            # Validações individuais
+            esta_integro = status_validacao.intact
+            eh_confiavel = status_validacao.valid
+            
             assinaturas.append({
                 "signer_name": nome_assinante,
-                "integrity": status_validacao.intact,
-                "trusted_chain": status_validacao.valid,
-                "status": "valid" if (status_validacao.intact and status_validacao.valid) else "invalid",
-                "message": "Assinatura valida e reconhecida." if status_validacao.valid else "Cadeia nao confiavel ou arquivo alterado."
+                "integrity": esta_integro,
+                "trusted_chain": eh_confiavel,
+                "status": "valid" if (esta_integro and eh_confiavel) else "invalid",
+                "message": "Assinatura valida e reconhecida." if eh_confiavel else "Cadeia nao confiavel ou arquivo alterado."
             })
             
         return {
@@ -56,6 +58,5 @@ async def validar_assinatura(file: UploadFile = File(...)):
         }
         
     except Exception as e:
+        # Retorno simples para o Apps Script
         return {"error": f"Falha no processamento: {str(e)}"}
-
-# Removido o uvicorn.run daqui para evitar conflito de loops no Render
