@@ -8,47 +8,38 @@ import os
 app = FastAPI()
 
 def carregar_raizes_confianca():
-    """
-    Varre a raiz do projeto em busca de arquivos .crt e .pem 
-    para carregar como âncoras de confiança.
-    """
     raizes = []
     extensoes_permitidas = ('.crt', '.pem')
-    
     for arquivo in os.listdir('.'):
         if arquivo.endswith(extensoes_permitidas):
             raizes.append(arquivo)
-    
     return raizes
 
 @app.post("/report")
 async def validar_assinatura(file: UploadFile = File(...)):
     try:
-        # Lê o arquivo PDF recebido
         content = await file.read()
         pdf_file = io.BytesIO(content)
         reader = PdfFileReader(pdf_file)
         
-        # Carrega dinamicamente todos os certificados que você subiu
         lista_certificados = carregar_raizes_confianca()
         
         try:
-            # Cria o contexto de validação com a cadeia completa informada
             vc = ValidationContext(trust_roots=lista_certificados)
         except Exception:
-            # Fallback caso haja erro no carregamento das cadeias
             vc = None
         
         assinaturas = []
         
-        # Itera sobre todas as assinaturas encontradas no documento
         for sig in reader.embedded_signatures:
-            # Realiza a validação criptográfica (Integridade + Cadeia de Confiança)
-            status_validacao = validate_pdf_signature(sig, validation_context=vc)
+            # CORREÇÃO: Usando ts_validation_context conforme sugerido pelo erro
+            status_validacao = validate_pdf_signature(
+                sig, 
+                ts_validation_context=vc 
+            )
             
             nome_assinante = sig.signer_cert.subject.native.get('common_name', 'Desconhecido')
             
-            # Validações individuais
             esta_integro = status_validacao.intact
             eh_confiavel = status_validacao.valid
             
@@ -66,7 +57,6 @@ async def validar_assinatura(file: UploadFile = File(...)):
         }
         
     except Exception as e:
-        # Retorno de erro formatado sem negritos para o Apps Script
         return {"error": f"Falha no processamento do documento: {str(e)}"}
 
 if __name__ == "__main__":
