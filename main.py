@@ -17,7 +17,7 @@ from pyhanko_certvalidator import ValidationContext
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("unilab_validacao_assinatura")
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 app = FastAPI(
     title="UNILAB - Validação de Assinatura Digital",
@@ -29,14 +29,28 @@ API_TOKEN = os.getenv("API_TOKEN", "").strip()
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "20"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-# Por padrão, os certificados ICP-Brasil estão na raiz do repositório.
-# Se CERTS_DIR for definido e não houver certificados ali, a API faz fallback
-# automático para a raiz do projeto.
+# Os certificados ICP-Brasil podem estar na raiz do repositório ou em certs/.
+# Ao varrer a raiz, a busca é limitada aos arquivos diretamente na raiz para
+# evitar carregar certificados de dependências instaladas no Render, como .venv/certifi.
 CERTS_DIR = Path(os.getenv("CERTS_DIR", ".")).resolve()
 PROJECT_ROOT = Path(".").resolve()
+CERTS_SUBDIR = (PROJECT_ROOT / "certs").resolve()
 
 REVOCATION_MODE = os.getenv("REVOCATION_MODE", "soft-fail").strip() or "soft-fail"
 CERT_EXTENSIONS = (".crt", ".cer", ".pem", ".der")
+EXCLUDED_CERT_DIR_NAMES = {
+    ".git",
+    ".github",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "env",
+    "node_modules",
+    "site-packages",
+    "venv",
+}
 
 
 def bool_env_(nome: str, padrao: bool = False) -> bool:
@@ -104,10 +118,30 @@ def caminho_relativo_(caminho: Path) -> str:
 
 
 def diretorios_de_certificados_() -> List[Path]:
-    diretorios = [CERTS_DIR]
-    if CERTS_DIR != PROJECT_ROOT:
-        diretorios.append(PROJECT_ROOT)
+    diretorios: List[Path] = []
+
+    for diretorio in (CERTS_DIR, CERTS_SUBDIR, PROJECT_ROOT):
+        if diretorio.exists() and diretorio.is_dir():
+            resolvido = diretorio.resolve()
+            if resolvido not in diretorios:
+                diretorios.append(resolvido)
+
     return diretorios
+
+
+def caminho_em_diretorio_excluido_(caminho: Path) -> bool:
+    partes = {parte.lower() for parte in caminho.parts}
+    return bool(partes.intersection(EXCLUDED_CERT_DIR_NAMES))
+
+
+def adicionar_arquivo_certificado_(arquivos: set, caminho: Path):
+    if not caminho.is_file():
+        return
+    if caminho.suffix.lower() not in CERT_EXTENSIONS:
+        return
+    if caminho_em_diretorio_excluido_(caminho):
+        return
+    arquivos.add(caminho.resolve())
 
 
 def coletar_arquivos_certificado_(diretorios: Iterable[Path]) -> List[Path]:
@@ -117,9 +151,16 @@ def coletar_arquivos_certificado_(diretorios: Iterable[Path]) -> List[Path]:
         if not diretorio.exists() or not diretorio.is_dir():
             continue
 
+        # Na raiz do projeto, coletar apenas arquivos soltos. Isso evita que a
+        # varredura entre em .venv/ e carregue certificados de pacotes Python.
+        if diretorio.resolve() == PROJECT_ROOT:
+            for caminho in diretorio.iterdir():
+                adicionar_arquivo_certificado_(arquivos, caminho)
+            continue
+
+        # Fora da raiz, como em certs/, a varredura é recursiva.
         for caminho in diretorio.rglob("*"):
-            if caminho.is_file() and caminho.suffix.lower() in CERT_EXTENSIONS:
-                arquivos.add(caminho.resolve())
+            adicionar_arquivo_certificado_(arquivos, caminho)
 
     return sorted(arquivos, key=lambda p: str(p).lower())
 
@@ -195,12 +236,6 @@ def certificado_eh_ca_(cert) -> bool:
 
 
 def classificar_certificado_(cert, caminho: Path) -> Tuple[str, str]:
-    """
-    Classificação operacional usada pela API:
-    - trust_root: certificado autoassinado. Em regra, é raiz.
-    - intermediate: certificado de autoridade certificadora emitido por outra AC.
-    - ignored_end_entity: certificado final de pessoa, empresa ou servidor.
-    """
     eh_autoassinado = certificado_eh_autoassinado_(cert)
     eh_ca = certificado_eh_ca_(cert)
 
@@ -291,6 +326,7 @@ def carregar_material_confianca_() -> Dict[str, Any]:
     return {
         "certs_dir": caminho_relativo_(CERTS_DIR),
         "scanned_dirs": [caminho_relativo_(d) for d in diretorios],
+        "excluded_dir_names": sorted(EXCLUDED_CERT_DIR_NAMES),
         "certificate_files": [caminho_relativo_(p) for p in certificate_paths],
         "trust_root_files": [
             item["path"] for item in material["classified"] if item["type"] == "trust_root"
@@ -314,6 +350,7 @@ def resumo_material_confianca_(material: Optional[Dict[str, Any]] = None) -> Dic
     return {
         "certs_dir": material["certs_dir"],
         "scanned_dirs": material["scanned_dirs"],
+        "excluded_dir_names": material["excluded_dir_names"],
         "certificate_files_total": len(material["certificate_files"]),
         "trust_roots_loaded": len(material["trust_roots"]),
         "intermediate_certs_loaded": len(material["intermediate_certs"]),
