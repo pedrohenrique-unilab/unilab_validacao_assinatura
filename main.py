@@ -17,7 +17,7 @@ from pyhanko_certvalidator import ValidationContext
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("unilab_validacao_assinatura")
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 app = FastAPI(
     title="UNILAB - Validação de Assinatura Digital",
@@ -38,6 +38,21 @@ CERTS_SUBDIR = (PROJECT_ROOT / "certs").resolve()
 
 REVOCATION_MODE = os.getenv("REVOCATION_MODE", "soft-fail").strip() or "soft-fail"
 CERT_EXTENSIONS = (".crt", ".cer", ".pem", ".der")
+
+# Apenas estes arquivos autoassinados devem entrar no ValidationContext como
+# raízes confiáveis. Raízes antigas, expiradas ou revogadas continuam sendo
+# listadas em /trust-info, mas não são usadas para confiar em uma cadeia.
+TRUSTED_ROOT_FILE_NAMES = {
+    "icp-brasilv4.crt",
+    "icp-brasilv5.crt",
+    "icp-brasilv6.crt",
+    "icp-brasilv7.crt",
+    "icp-brasilv10.crt",
+    "icp-brasilv11.crt",
+    "icp-brasilv12.crt",
+    "icp-brasilv13.crt",
+}
+
 EXCLUDED_CERT_DIR_NAMES = {
     ".git",
     ".github",
@@ -235,12 +250,18 @@ def certificado_eh_ca_(cert) -> bool:
     return False
 
 
+def arquivo_eh_raiz_confiavel_(caminho: Path) -> bool:
+    return caminho.name.lower() in TRUSTED_ROOT_FILE_NAMES
+
+
 def classificar_certificado_(cert, caminho: Path) -> Tuple[str, str]:
     eh_autoassinado = certificado_eh_autoassinado_(cert)
     eh_ca = certificado_eh_ca_(cert)
 
     if eh_autoassinado:
-        return "trust_root", "Certificado autoassinado identificado como raiz confiável."
+        if arquivo_eh_raiz_confiavel_(caminho):
+            return "trust_root", "Certificado autoassinado incluído na lista de raízes confiáveis ICP-Brasil."
+        return "ignored_untrusted_root", "Certificado autoassinado fora da lista de raízes confiáveis permitidas."
 
     if eh_ca:
         return "intermediate", "Certificado de autoridade certificadora não autoassinado identificado como intermediário."
@@ -256,6 +277,7 @@ def resumo_certificado_classificado_(cert, caminho: Path, tipo: str, motivo: str
         "reason": motivo,
         "is_self_signed": certificado_eh_autoassinado_(cert),
         "is_ca": certificado_eh_ca_(cert),
+        "is_trusted_root_file": arquivo_eh_raiz_confiavel_(caminho),
         "subject_common_name": dados.get("subject_common_name"),
         "issuer_common_name": dados.get("issuer_common_name"),
         "serial_number": dados.get("serial_number"),
@@ -308,6 +330,18 @@ def carregar_e_classificar_certificados_(caminhos: Iterable[Path]) -> Dict[str, 
     }
 
 
+def arquivos_por_tipo_(material: Dict[str, Any], tipo: str) -> List[str]:
+    return [
+        item["path"]
+        for item in material["classified"]
+        if item["type"] == tipo
+    ]
+
+
+def contar_por_tipo_(material: Dict[str, Any], tipo: str) -> int:
+    return len(arquivos_por_tipo_(material, tipo))
+
+
 @lru_cache(maxsize=1)
 def carregar_material_confianca_() -> Dict[str, Any]:
     diretorios = diretorios_de_certificados_()
@@ -315,7 +349,7 @@ def carregar_material_confianca_() -> Dict[str, Any]:
     material = carregar_e_classificar_certificados_(certificate_paths)
 
     logger.info(
-        "Material de confiança carregado: %s arquivo(s), %s raiz(es), %s intermediário(s), %s ignorado(s), %s erro(s).",
+        "Material de confiança carregado: %s arquivo(s), %s raiz(es) confiável(is), %s intermediário(s), %s ignorado(s), %s erro(s).",
         len(certificate_paths),
         len(material["trust_roots"]),
         len(material["intermediate_certs"]),
@@ -323,20 +357,20 @@ def carregar_material_confianca_() -> Dict[str, Any]:
         len(material["load_errors"]),
     )
 
+    untrusted_root_files = arquivos_por_tipo_(material, "ignored_untrusted_root")
+    ignored_end_entity_files = arquivos_por_tipo_(material, "ignored_end_entity")
+
     return {
         "certs_dir": caminho_relativo_(CERTS_DIR),
         "scanned_dirs": [caminho_relativo_(d) for d in diretorios],
         "excluded_dir_names": sorted(EXCLUDED_CERT_DIR_NAMES),
+        "trusted_root_file_allowlist": sorted(TRUSTED_ROOT_FILE_NAMES),
         "certificate_files": [caminho_relativo_(p) for p in certificate_paths],
-        "trust_root_files": [
-            item["path"] for item in material["classified"] if item["type"] == "trust_root"
-        ],
-        "intermediate_files": [
-            item["path"] for item in material["classified"] if item["type"] == "intermediate"
-        ],
-        "ignored_files": [
-            item["path"] for item in material["classified"] if item["type"] == "ignored_end_entity"
-        ],
+        "trust_root_files": arquivos_por_tipo_(material, "trust_root"),
+        "intermediate_files": arquivos_por_tipo_(material, "intermediate"),
+        "untrusted_root_files": untrusted_root_files,
+        "ignored_end_entity_files": ignored_end_entity_files,
+        "ignored_files": untrusted_root_files + ignored_end_entity_files,
         "trust_roots": material["trust_roots"],
         "intermediate_certs": material["intermediate_certs"],
         "ignored_certs": material["ignored_certs"],
@@ -351,12 +385,17 @@ def resumo_material_confianca_(material: Optional[Dict[str, Any]] = None) -> Dic
         "certs_dir": material["certs_dir"],
         "scanned_dirs": material["scanned_dirs"],
         "excluded_dir_names": material["excluded_dir_names"],
+        "trusted_root_file_allowlist": material["trusted_root_file_allowlist"],
         "certificate_files_total": len(material["certificate_files"]),
         "trust_roots_loaded": len(material["trust_roots"]),
         "intermediate_certs_loaded": len(material["intermediate_certs"]),
-        "ignored_end_entity_certs": len(material["ignored_certs"]),
+        "ignored_certs_total": len(material["ignored_certs"]),
+        "ignored_untrusted_root_certs": len(material["untrusted_root_files"]),
+        "ignored_end_entity_certs": len(material["ignored_end_entity_files"]),
         "trust_root_files": material["trust_root_files"],
         "intermediate_files": material["intermediate_files"],
+        "untrusted_root_files": material["untrusted_root_files"],
+        "ignored_end_entity_files": material["ignored_end_entity_files"],
         "ignored_files": material["ignored_files"],
         "classified_certificates": material["classified_certificates"],
         "load_errors": material["load_errors"],
