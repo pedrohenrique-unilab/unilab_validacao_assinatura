@@ -15,13 +15,19 @@ Resposta esperada:
   "success": true,
   "status": "ok",
   "service": "unilab_validacao_assinatura",
-  "version": "1.2.0"
+  "version": "1.3.0"
 }
 ```
 
 ### GET /trust-info
 
 Informa como está a configuração local dos certificados de confiança usados na validação da cadeia.
+
+A API faz a classificação automática dos certificados encontrados dentro da pasta `certs/`:
+
+- `trust_root`: certificado autoassinado, tratado como raiz confiável.
+- `intermediate`: certificado de autoridade certificadora não autoassinado, tratado como intermediário.
+- `ignored_end_entity`: certificado final de pessoa, empresa ou servidor, ignorado no contexto de confiança.
 
 Resposta esperada:
 
@@ -30,10 +36,27 @@ Resposta esperada:
   "success": true,
   "trust_configuration": {
     "certs_dir": "certs",
+    "certificate_files_total": 10,
     "trust_roots_loaded": 1,
-    "intermediate_certs_loaded": 2,
-    "trust_root_files": ["certs/trust_roots/exemplo.crt"],
-    "intermediate_files": ["certs/intermediates/exemplo-intermediario.crt"],
+    "intermediate_certs_loaded": 8,
+    "ignored_end_entity_certs": 1,
+    "trust_root_files": ["certs/AC_RAIZ.crt"],
+    "intermediate_files": ["certs/AC_INTERMEDIARIA.crt"],
+    "ignored_files": ["certs/certificado-final.crt"],
+    "classified_certificates": [
+      {
+        "path": "certs/AC_RAIZ.crt",
+        "type": "trust_root",
+        "reason": "Certificado autoassinado identificado como raiz confiável.",
+        "is_self_signed": true,
+        "is_ca": true,
+        "subject_common_name": "AC Raiz",
+        "issuer_common_name": "AC Raiz",
+        "serial_number": "123456789",
+        "not_before": "2025-01-01T00:00:00+00:00",
+        "not_after": "2035-01-01T00:00:00+00:00"
+      }
+    ],
     "load_errors": [],
     "allow_fetching_certs": false,
     "revocation_mode": "soft-fail"
@@ -88,9 +111,26 @@ Se `API_TOKEN` não estiver definida, o endpoint continua funcionando sem autent
 
 ## Certificados de confiança
 
-A API carrega certificados locais da pasta `certs/`.
+A API carrega todos os arquivos de certificado encontrados recursivamente dentro da pasta `certs/`.
 
-Estrutura recomendada:
+Formatos aceitos:
+
+```text
+.crt
+.cer
+.pem
+.der
+```
+
+A separação manual por pasta não é obrigatória. A API identifica automaticamente:
+
+```text
+subject == issuer          -> raiz confiável
+BasicConstraints CA=True   -> intermediário, quando não for autoassinado
+CA=False ou sem CA         -> certificado final ignorado
+```
+
+A estrutura recomendada continua sendo:
 
 ```text
 certs/
@@ -107,17 +147,6 @@ certs/intermediarios/
 certs/extra/
 ```
 
-Arquivos diretamente em `certs/` são tratados como certificados raiz confiáveis por compatibilidade operacional.
-
-Formatos aceitos:
-
-```text
-.crt
-.cer
-.pem
-.der
-```
-
 Variáveis de ambiente relacionadas:
 
 ```text
@@ -126,7 +155,7 @@ ALLOW_FETCHING_CERTS=false
 REVOCATION_MODE=soft-fail
 ```
 
-Recomendação: coloque certificados raiz ICP-Brasil em `certs/trust_roots/` e certificados intermediários em `certs/intermediates/`.
+Recomendação operacional: depois de cada alteração nos certificados, consulte `/trust-info` e confirme se `trust_roots_loaded` e `intermediate_certs_loaded` estão coerentes.
 
 ## Render
 
