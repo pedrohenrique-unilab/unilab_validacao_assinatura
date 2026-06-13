@@ -17,7 +17,7 @@ from pyhanko_certvalidator import ValidationContext
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("unilab_validacao_assinatura")
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 app = FastAPI(
     title="UNILAB - Validação de Assinatura Digital",
@@ -85,143 +85,18 @@ def serializar_valor_(valor: Any) -> Any:
     return valor
 
 
-def coletar_arquivos_certificado_(diretorios: Iterable[Path], somente_direto: bool = False) -> List[Path]:
+def coletar_arquivos_certificado_(diretorios: Iterable[Path]) -> List[Path]:
     arquivos = set()
 
     for diretorio in diretorios:
         if not diretorio.exists() or not diretorio.is_dir():
             continue
 
-        candidatos = diretorio.iterdir() if somente_direto else diretorio.rglob("*")
-        for caminho in candidatos:
+        for caminho in diretorio.rglob("*"):
             if caminho.is_file() and caminho.suffix.lower() in CERT_EXTENSIONS:
                 arquivos.add(caminho)
 
     return sorted(arquivos, key=lambda p: str(p).lower())
-
-
-def localizar_arquivos_certificados_() -> Tuple[List[Path], List[Path]]:
-    """
-    Convenção adotada:
-    - certs/trust_roots, certs/roots ou certs/raizes: certificados raiz confiáveis.
-    - certs/intermediates, certs/intermediarios ou certs/extra: certificados intermediários/auxiliares.
-    - arquivos diretamente em certs/: tratados como raízes confiáveis por compatibilidade operacional.
-    """
-    trust_dirs = [
-        CERTS_DIR / "trust_roots",
-        CERTS_DIR / "roots",
-        CERTS_DIR / "raizes",
-    ]
-    intermediate_dirs = [
-        CERTS_DIR / "intermediates",
-        CERTS_DIR / "intermediarios",
-        CERTS_DIR / "extra",
-    ]
-
-    trust_paths = coletar_arquivos_certificado_(trust_dirs)
-    trust_paths += coletar_arquivos_certificado_([CERTS_DIR], somente_direto=True)
-
-    intermediate_paths = coletar_arquivos_certificado_(intermediate_dirs)
-
-    trust_paths = sorted(set(trust_paths), key=lambda p: str(p).lower())
-    intermediate_paths = sorted(set(intermediate_paths), key=lambda p: str(p).lower())
-
-    return trust_paths, intermediate_paths
-
-
-def carregar_certificados_(caminhos: Iterable[Path]) -> Tuple[List[Any], List[Dict[str, str]]]:
-    certificados: List[Any] = []
-    erros: List[Dict[str, str]] = []
-
-    for caminho in caminhos:
-        try:
-            carregados = list(load_certs_from_pemder([str(caminho)]))
-            if not carregados:
-                erros.append({
-                    "path": str(caminho),
-                    "error": "Nenhum certificado foi encontrado no arquivo.",
-                })
-                continue
-            certificados.extend(carregados)
-        except Exception as exc:
-            logger.warning("Falha ao carregar certificado %s: %s", caminho, exc)
-            erros.append({
-                "path": str(caminho),
-                "error": str(exc),
-            })
-
-    return certificados, erros
-
-
-@lru_cache(maxsize=1)
-def carregar_material_confianca_() -> Dict[str, Any]:
-    trust_paths, intermediate_paths = localizar_arquivos_certificados_()
-    trust_roots, trust_errors = carregar_certificados_(trust_paths)
-    intermediate_certs, intermediate_errors = carregar_certificados_(intermediate_paths)
-
-    logger.info(
-        "Material de confiança carregado: %s raízes, %s intermediários, %s erro(s).",
-        len(trust_roots),
-        len(intermediate_certs),
-        len(trust_errors) + len(intermediate_errors),
-    )
-
-    return {
-        "certs_dir": str(CERTS_DIR),
-        "trust_root_files": [str(p) for p in trust_paths],
-        "intermediate_files": [str(p) for p in intermediate_paths],
-        "trust_roots": trust_roots,
-        "intermediate_certs": intermediate_certs,
-        "load_errors": trust_errors + intermediate_errors,
-    }
-
-
-def resumo_material_confianca_(material: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    material = material or carregar_material_confianca_()
-    return {
-        "certs_dir": material["certs_dir"],
-        "trust_roots_loaded": len(material["trust_roots"]),
-        "intermediate_certs_loaded": len(material["intermediate_certs"]),
-        "trust_root_files": material["trust_root_files"],
-        "intermediate_files": material["intermediate_files"],
-        "load_errors": material["load_errors"],
-        "allow_fetching_certs": ALLOW_FETCHING_CERTS,
-        "revocation_mode": REVOCATION_MODE,
-    }
-
-
-def montar_contexto_validacao_() -> Tuple[Optional[ValidationContext], Dict[str, Any]]:
-    material = carregar_material_confianca_()
-    trust_roots = material["trust_roots"]
-    intermediate_certs = material["intermediate_certs"]
-
-    if not trust_roots:
-        logger.info("Nenhum certificado raiz confiável carregado no projeto.")
-        return None, material
-
-    try:
-        contexto = ValidationContext(
-            trust_roots=trust_roots,
-            other_certs=intermediate_certs or None,
-            allow_fetching=ALLOW_FETCHING_CERTS,
-            revocation_mode=REVOCATION_MODE,
-        )
-        return contexto, material
-    except Exception as exc:
-        logger.warning("Falha ao criar ValidationContext: %s", exc)
-        material = dict(material)
-        material["load_errors"] = list(material.get("load_errors", [])) + [{
-            "path": "ValidationContext",
-            "error": str(exc),
-        }]
-        return None, material
-
-
-def obter_nome_assinante_(sig) -> str:
-    try:
-        return sig.signer_cert.subject.native.get("common_name", "Desconhecido")
-    except Exception:
-        return "Desconhecido"
 
 
 def certificado_para_json_(cert) -> Dict[str, Any]:
@@ -263,6 +138,200 @@ def certificado_para_json_(cert) -> Dict[str, Any]:
         "not_before": not_before,
         "not_after": not_after,
     }
+
+
+def certificado_eh_autoassinado_(cert) -> bool:
+    try:
+        return cert.subject.dump() == cert.issuer.dump()
+    except Exception:
+        try:
+            return cert.subject.native == cert.issuer.native
+        except Exception:
+            return False
+
+
+def certificado_eh_ca_(cert) -> bool:
+    try:
+        extensions = cert["tbs_certificate"]["extensions"]
+    except Exception:
+        return False
+
+    for extension in extensions:
+        try:
+            if extension["extn_id"].native != "basic_constraints":
+                continue
+            parsed = extension["extn_value"].parsed.native
+            if isinstance(parsed, dict):
+                return bool(parsed.get("ca"))
+        except Exception:
+            continue
+
+    return False
+
+
+def classificar_certificado_(cert, caminho: Path) -> Tuple[str, str]:
+    """
+    Classificação operacional usada pela API:
+    - trust_root: certificado autoassinado. Em regra, é raiz.
+    - intermediate: certificado de autoridade certificadora emitido por outra AC.
+    - ignored_end_entity: certificado final de pessoa, empresa ou servidor. Não entra no contexto de confiança.
+    """
+    eh_autoassinado = certificado_eh_autoassinado_(cert)
+    eh_ca = certificado_eh_ca_(cert)
+
+    if eh_autoassinado:
+        return "trust_root", "Certificado autoassinado identificado como raiz confiável."
+
+    if eh_ca:
+        return "intermediate", "Certificado de autoridade certificadora não autoassinado identificado como intermediário."
+
+    return "ignored_end_entity", "Certificado final não usado como raiz nem intermediário."
+
+
+def resumo_certificado_classificado_(cert, caminho: Path, tipo: str, motivo: str) -> Dict[str, Any]:
+    dados = certificado_para_json_(cert)
+    return {
+        "path": str(caminho),
+        "type": tipo,
+        "reason": motivo,
+        "is_self_signed": certificado_eh_autoassinado_(cert),
+        "is_ca": certificado_eh_ca_(cert),
+        "subject_common_name": dados.get("subject_common_name"),
+        "issuer_common_name": dados.get("issuer_common_name"),
+        "serial_number": dados.get("serial_number"),
+        "not_before": dados.get("not_before"),
+        "not_after": dados.get("not_after"),
+    }
+
+
+def carregar_e_classificar_certificados_(caminhos: Iterable[Path]) -> Dict[str, Any]:
+    trust_roots: List[Any] = []
+    intermediate_certs: List[Any] = []
+    ignored_certs: List[Any] = []
+    classified: List[Dict[str, Any]] = []
+    erros: List[Dict[str, str]] = []
+
+    for caminho in caminhos:
+        try:
+            carregados = list(load_certs_from_pemder([str(caminho)]))
+            if not carregados:
+                erros.append({
+                    "path": str(caminho),
+                    "error": "Nenhum certificado foi encontrado no arquivo.",
+                })
+                continue
+
+            for cert in carregados:
+                tipo, motivo = classificar_certificado_(cert, caminho)
+                classified.append(resumo_certificado_classificado_(cert, caminho, tipo, motivo))
+
+                if tipo == "trust_root":
+                    trust_roots.append(cert)
+                elif tipo == "intermediate":
+                    intermediate_certs.append(cert)
+                else:
+                    ignored_certs.append(cert)
+
+        except Exception as exc:
+            logger.warning("Falha ao carregar certificado %s: %s", caminho, exc)
+            erros.append({
+                "path": str(caminho),
+                "error": str(exc),
+            })
+
+    return {
+        "trust_roots": trust_roots,
+        "intermediate_certs": intermediate_certs,
+        "ignored_certs": ignored_certs,
+        "classified": sorted(classified, key=lambda item: (item["type"], item["path"].lower())),
+        "load_errors": erros,
+    }
+
+
+@lru_cache(maxsize=1)
+def carregar_material_confianca_() -> Dict[str, Any]:
+    certificate_paths = coletar_arquivos_certificado_([CERTS_DIR])
+    material = carregar_e_classificar_certificados_(certificate_paths)
+
+    logger.info(
+        "Material de confiança carregado: %s arquivo(s), %s raiz(es), %s intermediário(s), %s ignorado(s), %s erro(s).",
+        len(certificate_paths),
+        len(material["trust_roots"]),
+        len(material["intermediate_certs"]),
+        len(material["ignored_certs"]),
+        len(material["load_errors"]),
+    )
+
+    return {
+        "certs_dir": str(CERTS_DIR),
+        "certificate_files": [str(p) for p in certificate_paths],
+        "trust_root_files": [
+            item["path"] for item in material["classified"] if item["type"] == "trust_root"
+        ],
+        "intermediate_files": [
+            item["path"] for item in material["classified"] if item["type"] == "intermediate"
+        ],
+        "ignored_files": [
+            item["path"] for item in material["classified"] if item["type"] == "ignored_end_entity"
+        ],
+        "trust_roots": material["trust_roots"],
+        "intermediate_certs": material["intermediate_certs"],
+        "ignored_certs": material["ignored_certs"],
+        "classified_certificates": material["classified"],
+        "load_errors": material["load_errors"],
+    }
+
+
+def resumo_material_confianca_(material: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    material = material or carregar_material_confianca_()
+    return {
+        "certs_dir": material["certs_dir"],
+        "certificate_files_total": len(material["certificate_files"]),
+        "trust_roots_loaded": len(material["trust_roots"]),
+        "intermediate_certs_loaded": len(material["intermediate_certs"]),
+        "ignored_end_entity_certs": len(material["ignored_certs"]),
+        "trust_root_files": material["trust_root_files"],
+        "intermediate_files": material["intermediate_files"],
+        "ignored_files": material["ignored_files"],
+        "classified_certificates": material["classified_certificates"],
+        "load_errors": material["load_errors"],
+        "allow_fetching_certs": ALLOW_FETCHING_CERTS,
+        "revocation_mode": REVOCATION_MODE,
+    }
+
+
+def montar_contexto_validacao_() -> Tuple[Optional[ValidationContext], Dict[str, Any]]:
+    material = carregar_material_confianca_()
+    trust_roots = material["trust_roots"]
+    intermediate_certs = material["intermediate_certs"]
+
+    if not trust_roots:
+        logger.info("Nenhum certificado raiz confiável carregado no projeto.")
+        return None, material
+
+    try:
+        contexto = ValidationContext(
+            trust_roots=trust_roots,
+            other_certs=intermediate_certs or None,
+            allow_fetching=ALLOW_FETCHING_CERTS,
+            revocation_mode=REVOCATION_MODE,
+        )
+        return contexto, material
+    except Exception as exc:
+        logger.warning("Falha ao criar ValidationContext: %s", exc)
+        material = dict(material)
+        material["load_errors"] = list(material.get("load_errors", [])) + [{
+            "path": "ValidationContext",
+            "error": str(exc),
+        }]
+        return None, material
+
+
+def obter_nome_assinante_(sig) -> str:
+    try:
+        return sig.signer_cert.subject.native.get("common_name", "Desconhecido")
+    except Exception:
+        return "Desconhecido"
 
 
 def mensagem_assinatura_(integro: bool, cadeia_confiavel: bool, contexto_configurado: bool) -> str:
