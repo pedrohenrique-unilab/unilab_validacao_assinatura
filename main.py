@@ -17,7 +17,7 @@ from pyhanko_certvalidator import ValidationContext
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("unilab_validacao_assinatura")
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 app = FastAPI(
     title="UNILAB - Validação de Assinatura Digital",
@@ -28,7 +28,13 @@ app = FastAPI(
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "20"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-CERTS_DIR = Path(os.getenv("CERTS_DIR", "certs"))
+
+# Por padrão, os certificados ICP-Brasil estão na raiz do repositório.
+# Se CERTS_DIR for definido e não houver certificados ali, a API faz fallback
+# automático para a raiz do projeto.
+CERTS_DIR = Path(os.getenv("CERTS_DIR", ".")).resolve()
+PROJECT_ROOT = Path(".").resolve()
+
 REVOCATION_MODE = os.getenv("REVOCATION_MODE", "soft-fail").strip() or "soft-fail"
 CERT_EXTENSIONS = (".crt", ".cer", ".pem", ".der")
 
@@ -43,7 +49,12 @@ def bool_env_(nome: str, padrao: bool = False) -> bool:
 ALLOW_FETCHING_CERTS = bool_env_("ALLOW_FETCHING_CERTS", False)
 
 
-def resposta_erro(error_type: str, message: str, status_code: int = 400, details: Optional[str] = None):
+def resposta_erro(
+    error_type: str,
+    message: str,
+    status_code: int = 400,
+    details: Optional[str] = None,
+):
     payload = {
         "success": False,
         "error": message,
@@ -85,6 +96,20 @@ def serializar_valor_(valor: Any) -> Any:
     return valor
 
 
+def caminho_relativo_(caminho: Path) -> str:
+    try:
+        return str(caminho.resolve().relative_to(PROJECT_ROOT))
+    except Exception:
+        return str(caminho)
+
+
+def diretorios_de_certificados_() -> List[Path]:
+    diretorios = [CERTS_DIR]
+    if CERTS_DIR != PROJECT_ROOT:
+        diretorios.append(PROJECT_ROOT)
+    return diretorios
+
+
 def coletar_arquivos_certificado_(diretorios: Iterable[Path]) -> List[Path]:
     arquivos = set()
 
@@ -94,7 +119,7 @@ def coletar_arquivos_certificado_(diretorios: Iterable[Path]) -> List[Path]:
 
         for caminho in diretorio.rglob("*"):
             if caminho.is_file() and caminho.suffix.lower() in CERT_EXTENSIONS:
-                arquivos.add(caminho)
+                arquivos.add(caminho.resolve())
 
     return sorted(arquivos, key=lambda p: str(p).lower())
 
@@ -174,7 +199,7 @@ def classificar_certificado_(cert, caminho: Path) -> Tuple[str, str]:
     Classificação operacional usada pela API:
     - trust_root: certificado autoassinado. Em regra, é raiz.
     - intermediate: certificado de autoridade certificadora emitido por outra AC.
-    - ignored_end_entity: certificado final de pessoa, empresa ou servidor. Não entra no contexto de confiança.
+    - ignored_end_entity: certificado final de pessoa, empresa ou servidor.
     """
     eh_autoassinado = certificado_eh_autoassinado_(cert)
     eh_ca = certificado_eh_ca_(cert)
@@ -191,7 +216,7 @@ def classificar_certificado_(cert, caminho: Path) -> Tuple[str, str]:
 def resumo_certificado_classificado_(cert, caminho: Path, tipo: str, motivo: str) -> Dict[str, Any]:
     dados = certificado_para_json_(cert)
     return {
-        "path": str(caminho),
+        "path": caminho_relativo_(caminho),
         "type": tipo,
         "reason": motivo,
         "is_self_signed": certificado_eh_autoassinado_(cert),
@@ -216,7 +241,7 @@ def carregar_e_classificar_certificados_(caminhos: Iterable[Path]) -> Dict[str, 
             carregados = list(load_certs_from_pemder([str(caminho)]))
             if not carregados:
                 erros.append({
-                    "path": str(caminho),
+                    "path": caminho_relativo_(caminho),
                     "error": "Nenhum certificado foi encontrado no arquivo.",
                 })
                 continue
@@ -235,7 +260,7 @@ def carregar_e_classificar_certificados_(caminhos: Iterable[Path]) -> Dict[str, 
         except Exception as exc:
             logger.warning("Falha ao carregar certificado %s: %s", caminho, exc)
             erros.append({
-                "path": str(caminho),
+                "path": caminho_relativo_(caminho),
                 "error": str(exc),
             })
 
@@ -250,7 +275,8 @@ def carregar_e_classificar_certificados_(caminhos: Iterable[Path]) -> Dict[str, 
 
 @lru_cache(maxsize=1)
 def carregar_material_confianca_() -> Dict[str, Any]:
-    certificate_paths = coletar_arquivos_certificado_([CERTS_DIR])
+    diretorios = diretorios_de_certificados_()
+    certificate_paths = coletar_arquivos_certificado_(diretorios)
     material = carregar_e_classificar_certificados_(certificate_paths)
 
     logger.info(
@@ -263,8 +289,9 @@ def carregar_material_confianca_() -> Dict[str, Any]:
     )
 
     return {
-        "certs_dir": str(CERTS_DIR),
-        "certificate_files": [str(p) for p in certificate_paths],
+        "certs_dir": caminho_relativo_(CERTS_DIR),
+        "scanned_dirs": [caminho_relativo_(d) for d in diretorios],
+        "certificate_files": [caminho_relativo_(p) for p in certificate_paths],
         "trust_root_files": [
             item["path"] for item in material["classified"] if item["type"] == "trust_root"
         ],
@@ -286,6 +313,7 @@ def resumo_material_confianca_(material: Optional[Dict[str, Any]] = None) -> Dic
     material = material or carregar_material_confianca_()
     return {
         "certs_dir": material["certs_dir"],
+        "scanned_dirs": material["scanned_dirs"],
         "certificate_files_total": len(material["certificate_files"]),
         "trust_roots_loaded": len(material["trust_roots"]),
         "intermediate_certs_loaded": len(material["intermediate_certs"]),
